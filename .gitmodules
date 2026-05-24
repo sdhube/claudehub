@@ -1,0 +1,4 @@
+[submodule "external/calibre"]
+	path = external/calibre
+	url = https://github.com/sdhube/calibre.git
+	branch = latest
