@@ -1,10 +1,17 @@
 //! Git operations and metadata management.
 //!
-//! This module handles all git-related operations including storing and retrieving
-//! git metadata (commit hashes, blob hashes) and git history for PDF files.
+//! This module handles all git-related operations including:
+//! - Running git commands with the PDF file's directory as the working directory
+//! - Extracting and storing git metadata (commit hashes, blob hashes)
+//! - Managing git history for PDF files
+//!
+//! All git operations are performed with the repository root as the working directory,
+//! which is automatically detected based on the PDF file's location.
 
 use rusqlite::Connection;
+use std::path::{Path, PathBuf};
 use crate::error::Result;
+use crate::CalibreError;
 
 /// Represents git metadata for a PDF file
 #[derive(Debug, Clone)]
@@ -24,11 +31,193 @@ pub struct GitHistoryEntry {
     pub commit_order: i32,
 }
 
-/// Manager for git-related database operations
+/// Represents git metadata extracted from a file
+#[derive(Debug, Clone)]
+pub struct ExtractedGitMetadata {
+    /// The commit hash of the file's last modification.
+    pub commit_hash: String,
+    /// The git history (list of commits touching this file).
+    pub history: Vec<String>,
+    /// The binary hash (blob hash) of the file in Git.
+    pub blob_hash: String,
+}
+
+/// Manager for git-related database operations and git command execution
 pub struct GitManager;
 
 impl GitManager {
-    /// Store git metadata for a PDF entry
+    /// Extract git metadata from a file path.
+    ///
+    /// This function:
+    /// 1. Finds the git repository root by looking for .git directory
+    /// 2. Runs git commands with the repository root as the working directory
+    /// 3. Extracts commit hash, blob hash, and git history
+    ///
+    /// # Arguments
+    ///
+    /// * `file_path` - Full path to the PDF file
+    ///
+    /// # Returns
+    ///
+    /// Extracted git metadata if the file is in a git repository
+    pub fn extract_git_metadata(file_path: &Path) -> Result<ExtractedGitMetadata> {
+        // Find the git repository root
+        let repo_root = Self::find_git_root(file_path)?;
+
+        // Get relative path from repo root
+        let relative_path = file_path
+            .strip_prefix(&repo_root)
+            .unwrap_or(file_path);
+
+        // Get the commit hash of last modification
+        let commit_hash = Self::get_last_commit_hash(&repo_root, relative_path)?;
+
+        // Get the git history
+        let history = Self::get_git_history(&repo_root, relative_path)?;
+
+        // Get the blob hash
+        let blob_hash = Self::get_blob_hash(&repo_root, relative_path)?;
+
+        Ok(ExtractedGitMetadata {
+            commit_hash,
+            history,
+            blob_hash,
+        })
+    }
+
+    /// Find the git repository root by checking for .git directory.
+    ///
+    /// Walks up the directory tree from the given path until it finds a .git directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `start_path` - Starting path (usually the PDF file location)
+    ///
+    /// # Returns
+    ///
+    /// Path to the git repository root
+    fn find_git_root(start_path: &Path) -> Result<PathBuf> {
+        let mut current = if start_path.is_file() {
+            start_path.parent().unwrap_or(start_path).to_path_buf()
+        } else {
+            start_path.to_path_buf()
+        };
+
+        loop {
+            if current.join(".git").exists() {
+                tracing::info!("Found git root at: {}", current.display());
+                return Ok(current);
+            }
+
+            if !current.pop() {
+                return Err(CalibreError::InvalidPath(
+                    "No Git repository found".to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Get the last commit hash for a file using git log.
+    ///
+    /// Runs: `git log -1 --format=%H <file>`
+    ///
+    /// # Arguments
+    ///
+    /// * `repo_root` - Root directory of the git repository (working directory for git command)
+    /// * `relative_path` - Path to the file relative to repo root
+    fn get_last_commit_hash(repo_root: &Path, relative_path: &Path) -> Result<String> {
+        let output = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(&["log", "-1", "--format=%H"])
+            .arg(relative_path.to_string_lossy().as_ref())
+            .output()?;
+
+        if !output.status.success() {
+            return Err(CalibreError::InvalidPath(
+                "Failed to get git commit hash".to_string(),
+            ));
+        }
+
+        let hash = String::from_utf8(output.stdout)?
+            .trim()
+            .to_string();
+
+        if hash.is_empty() {
+            return Err(CalibreError::InvalidPath(
+                "No commit found for file".to_string(),
+            ));
+        }
+
+        tracing::info!("Got commit hash: {}", hash);
+        Ok(hash)
+    }
+
+    /// Get the complete git history (list of commit hashes) for a file.
+    ///
+    /// Runs: `git log --format=%H <file>`
+    ///
+    /// # Arguments
+    ///
+    /// * `repo_root` - Root directory of the git repository (working directory for git command)
+    /// * `relative_path` - Path to the file relative to repo root
+    fn get_git_history(repo_root: &Path, relative_path: &Path) -> Result<Vec<String>> {
+        let output = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(&["log", "--format=%H"])
+            .arg(relative_path.to_string_lossy().as_ref())
+            .output()?;
+
+        if !output.status.success() {
+            tracing::warn!("Failed to get git history");
+            return Ok(Vec::new());
+        }
+
+        let history = String::from_utf8(output.stdout)?
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        tracing::info!("Got {} history entries", history.len());
+        Ok(history)
+    }
+
+    /// Get the blob hash (object hash) of a file in git.
+    ///
+    /// Runs: `git hash-object <file>`
+    ///
+    /// # Arguments
+    ///
+    /// * `repo_root` - Root directory of the git repository (working directory for git command)
+    /// * `relative_path` - Path to the file relative to repo root
+    fn get_blob_hash(repo_root: &Path, relative_path: &Path) -> Result<String> {
+        let output = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(&["hash-object"])
+            .arg(relative_path.to_string_lossy().as_ref())
+            .output()?;
+
+        if !output.status.success() {
+            return Err(CalibreError::InvalidPath(
+                "Failed to get git blob hash".to_string(),
+            ));
+        }
+
+        let hash = String::from_utf8(output.stdout)?
+            .trim()
+            .to_string();
+
+        if hash.is_empty() {
+            return Err(CalibreError::InvalidPath(
+                "No blob hash found for file".to_string(),
+            ));
+        }
+
+        tracing::info!("Got blob hash: {}", hash);
+        Ok(hash)
+    }
+
+    /// Store git metadata for a PDF entry in the database
     ///
     /// # Arguments
     ///
@@ -62,7 +251,7 @@ impl GitManager {
         Ok(id)
     }
 
-    /// Retrieve git metadata for a PDF entry
+    /// Retrieve git metadata for a PDF entry from the database
     ///
     /// # Arguments
     ///
@@ -98,7 +287,7 @@ impl GitManager {
         }
     }
 
-    /// Update git metadata for a PDF entry
+    /// Update git metadata for a PDF entry in the database
     ///
     /// # Arguments
     ///
@@ -123,7 +312,7 @@ impl GitManager {
         Ok(())
     }
 
-    /// Add an entry to git history
+    /// Add an entry to git history in the database
     ///
     /// # Arguments
     ///
@@ -157,7 +346,7 @@ impl GitManager {
         Ok(id)
     }
 
-    /// Retrieve all git history entries for a PDF entry
+    /// Retrieve all git history entries for a PDF entry from the database
     ///
     /// # Arguments
     ///
@@ -167,7 +356,7 @@ impl GitManager {
     /// # Returns
     ///
     /// Vector of git history entries ordered by commit_order
-    pub fn get_git_history(
+    pub fn get_git_history_from_db(
         conn: &Connection,
         pdf_entry_id: i64,
     ) -> Result<Vec<GitHistoryEntry>> {
@@ -195,7 +384,7 @@ impl GitManager {
         Ok(result)
     }
 
-    /// Clear all git history for a PDF entry
+    /// Clear all git history for a PDF entry from the database
     ///
     /// # Arguments
     ///
@@ -298,7 +487,7 @@ mod tests {
         GitManager::add_git_history(&conn, pdf_entry_id, "commit3", 3).unwrap();
 
         // Retrieve history
-        let history = GitManager::get_git_history(&conn, pdf_entry_id).unwrap();
+        let history = GitManager::get_git_history_from_db(&conn, pdf_entry_id).unwrap();
 
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].commit_hash, "commit1");
